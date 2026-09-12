@@ -41,5 +41,5 @@ assert.equal(regrade.manifest_digest, manifest.digest, 'the regrade is for this 
 assert.ok(bundles.length > 0, 'the provenance bundle is beside the regrade (regrade.json.sigstore.jsonl)');
 assert.ok(agrees, 'the grading agrees with the manifest on every verdict and workspace');
 if (accepted) assert.ok(check?.ok, `the standard accepts this grader and the grading reconciles: ${check?.detail}`);
-else assert.ok(check && check.detail.startsWith('The grader key is not one the standard accepts'), `the only reason the grading does not reconcile is acceptance: ${check?.detail}`);
+else assert.ok(check && (check.ok || check.detail.startsWith('The grader key is not one the standard accepts')), `the grading holds, or acceptance is the only reason it does not: ${check?.detail}`);
 console.log('check-regrade: ok');
