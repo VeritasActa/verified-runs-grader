@@ -1,0 +1,74 @@
+# A grading of someone else's verified run, made here, signed here, attested here.
+#
+# Checks out the run from the repository that holds it, rebuilds each task's
+# workspace from the archive the manifest pins, obtains the pinned tests, runs
+# them, and signs the verdicts under a key this workflow run generates and
+# discards. GitHub's build provenance then names the bytes of that grading, the
+# workflow, the repository, and the run that made it. A reader verifies the
+# grading with the provenance bundle beside it; a standard that names this
+# repository under trust.accepted_grader_provenance accepts it without any key
+# listed in advance.
+#
+# Needs nothing for a public task set. For a sealed set, SEALED_TASKS_KEY.
+name: regrade
+on:
+  workflow_dispatch:
+    inputs:
+      runs_repository:
+        description: 'the repository holding the run'
+        default: ScopeBlind/verified-runs
+      ref:
+        description: 'the commit or branch of that repository'
+        default: main
+      run:
+        description: 'the run folder in that repository, e.g. runs/<name>'
+        required: true
+      sealed:
+        description: 'for a sealed task set: the sealed archive path in that repository (needs SEALED_TASKS_KEY)'
+        default: ''
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+jobs:
+  regrade:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.runs_repository }}
+          ref: ${{ inputs.ref }}
+          path: runs-repository
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - run: pip install pytest==8.4.1
+      - name: Grade the run again
+        env:
+          SEALED_TASKS_KEY: ${{ secrets.SEALED_TASKS_KEY }}
+          GH_TOKEN: ${{ github.token }}
+          LEGATE_ATTEST: github-actions-provenance
+          LEGATE_GRADER_NAME: VeritasActa verified-runs grader
+        run: |
+          mkdir -p "$RUNNER_TEMP/regrade"
+          sealed='${{ inputs.sealed }}'
+          if [ -n "$sealed" ]; then extra="--sealed runs-repository/$sealed"; else extra=""; fi
+          # A disagreeing grading exits 1 and is still written, attested, and kept: it is the material outcome.
+          node harness/regrade.mjs --run "runs-repository/${{ inputs.run }}" $extra --sign --keys ephemeral --out "$RUNNER_TEMP/regrade/regrade.json" || [ -f "$RUNNER_TEMP/regrade/regrade.json" ]
+      - name: Attest provenance of the grading
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ runner.temp }}/regrade/regrade.json
+      - name: Keep the attestation bundle beside it
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd "$RUNNER_TEMP/regrade" && gh attestation download regrade.json -R "$GITHUB_REPOSITORY" && mv sha256:*.jsonl regrade.json.sigstore.jsonl && ls -la
+      - uses: actions/upload-artifact@v4
+        with:
+          name: regrade
+          path: ${{ runner.temp }}/regrade
+      - name: Check the grading as a reader would
+        run: node harness/check-regrade.mjs "runs-repository/${{ inputs.run }}" "$RUNNER_TEMP/regrade"

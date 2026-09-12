@@ -1,0 +1,15 @@
+{
+  "name": "@veritasacta/verified-runs-grader",
+  "private": true,
+  "version": "0.1.0",
+  "description": "A grading of someone else's verified run, made in this repository's workflow, signed under a key the run generates and discards, and bound to this repository by provenance.",
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "regrade": "node harness/regrade.mjs",
+    "check": "node harness/check-regrade.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
