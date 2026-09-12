@@ -72,3 +72,9 @@ jobs:
           path: ${{ runner.temp }}/regrade
       - name: Check the grading as a reader would
         run: node harness/check-regrade.mjs "runs-repository/${{ inputs.run }}" "$RUNNER_TEMP/regrade"
+      - name: Read the run with the published verifier, this grading included
+        run: |
+          r="runs-repository/${{ inputs.run }}"
+          extra=""; if [ -f "$r/model-calls.jsonl" ]; then extra="--model-calls $r/model-calls.jsonl --model-attestation $r/model-attestation.json"; fi
+          own=""; if [ -f "$r/regrade.json" ]; then own="--regrade $r/regrade.json"; fi
+          npx @veritasacta/verify "$r/manifest.json" --standard "$r/standard.json" --receipts "$r/receipts.jsonl" --calls "$r/calls.jsonl" $own --regrade "$RUNNER_TEMP/regrade/regrade.json" --provenance "$r/provenance" --provenance "$RUNNER_TEMP/regrade" $extra || echo "The published verifier did not bind the run with this grading: the run's standard may predate this grader, in which case the grading stands as a third word the standard did not choose."

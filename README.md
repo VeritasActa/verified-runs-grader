@@ -30,6 +30,14 @@ It establishes that a party other than the one that made the run rebuilt the arc
 
 One person administers both organizations today. What separates the two gradings is the repository, the workflow, the runner, and the key, each of which the provenance names, and none of which the runs repository's workflow can reach. A grading by a stranger is the next step, and this repository is the template for one: fork it, and the runs repository's standard can name your fork.
 
+## Become a grader
+
+Three steps, no keys to manage:
+
+1. Fork this repository under your own organization. The workflow, the grading script, and the vendored verifier come with it; the key is generated inside each run.
+2. Run `regrade.yml` on any run in the runs repository (`-f run=runs/<name>`). The grading and its provenance bundle are the run's artifact; `gh attestation verify regrade.json --owner <your org>` checks the bundle independently.
+3. Ask the runs repository's maintainer to name your fork under `trust.accepted_grader_provenance` (the workflow flag `--accept-grader-repo https://github.com/<you>/<fork>`). From then on your gradings reconcile runs; until then they stand as a third word the standard did not choose, and a reader weighs them as such.
+
 ## Contents
 
 - `harness/regrade.mjs`: the grading script, the same file the runs repository uses (`--keys ephemeral` signs under a key held by the workflow run alone; `LEGATE_GRADER_NAME` names the grader).
