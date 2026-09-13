@@ -2821,6 +2821,100 @@ function verifyActaChain(receipts, options = {}) {
   };
 }
 
+// src/temporal.ts
+var TEMPORAL_POLICY_V1 = "legate-temporal.v1";
+var globToRegExp = (glob) => new RegExp(`^${glob.split("*").map((s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join(".*")}$`, "s");
+var likes = (pattern, value) => {
+  if (pattern === void 0) return true;
+  if (value === null) return null;
+  const list = Array.isArray(pattern) ? pattern : [pattern];
+  return list.some((p) => globToRegExp(p).test(value));
+};
+function matches(filter, e) {
+  if (filter.tool !== void 0 && filter.tool !== e.tool) return false;
+  if (filter.decision !== void 0 && filter.decision !== e.decision) return false;
+  return likes(filter.command_like, e.command);
+}
+var needsCommand = (f) => f.command_like !== void 0;
+function projectEvents(receipts, options = {}) {
+  const attemptOf = (i) => options.attempts?.find((a) => i >= a.receipts.from && i < a.receipts.to) ?? null;
+  return receipts.map((r, i) => {
+    const call = options.calls?.[i] ?? null;
+    const input = call && call.tool === r.tool ? call.input : null;
+    const command = input === null ? null : typeof input === "string" ? input : typeof input.command === "string" ? String(input.command) : JSON.stringify(input);
+    const a = attemptOf(i);
+    return { index: i, at: Date.parse(r.issued_at), tool: r.tool, decision: r.decision, input_digest: r.input_hash, command, task_id: a?.task_id ?? null, attempt: a?.attempt ?? null, link: r.link };
+  });
+}
+var sameScope = (rule, a, b) => rule.scope === "run" || a.task_id === b.task_id && a.attempt === b.attempt;
+function evaluateTemporal(events, policy) {
+  const results = [];
+  for (const rule of policy.rules) {
+    const filters = rule.kind === "count_within" ? [rule.filter] : rule.kind === "forbid_after" ? [rule.trigger, rule.forbid] : [rule.before, rule.require];
+    if (filters.some(needsCommand) && events.some((e) => e.command === null)) {
+      results.push({ rule, evaluable: false, reason: "the rule reads the command behind each call, and the calls log is not supplied for every receipt", events_examined: events.length, violations: [] });
+      continue;
+    }
+    const violations = [];
+    const iso = (e) => new Date(e.at).toISOString();
+    for (let i = 0; i < events.length; i++) {
+      const e = events[i];
+      const history = events.slice(0, i).filter((h) => sameScope(rule, h, e));
+      if (rule.kind === "count_within") {
+        if (matches(rule.filter, e) !== true) continue;
+        const n = history.filter((h) => matches(rule.filter, h) === true && e.at - h.at <= rule.window_seconds * 1e3).length + 1;
+        if (n > rule.max) violations.push({ rule: rule.id, event_index: i, at: iso(e), link: e.link, detail: `${n} matching calls within ${rule.window_seconds} s at receipt ${i} (${e.tool}, ${e.decision}); the rule allows ${rule.max}.` });
+      } else if (rule.kind === "forbid_after") {
+        if (matches(rule.forbid, e) !== true) continue;
+        const trigger = history.find((h) => matches(rule.trigger, h) === true);
+        if (trigger) violations.push({ rule: rule.id, event_index: i, at: iso(e), link: e.link, detail: `receipt ${i} (${e.tool}) matches what is forbidden after receipt ${trigger.index} (${trigger.tool}) matched the trigger; the label does not expire.` });
+      } else {
+        if (matches(rule.before, e) !== true) continue;
+        const prior = history.find((h) => matches(rule.require, h) === true && e.at - h.at <= rule.window_seconds * 1e3);
+        if (!prior) violations.push({ rule: rule.id, event_index: i, at: iso(e), link: e.link, detail: `receipt ${i} (${e.tool}) has no required prior event within ${rule.window_seconds} s before it.` });
+      }
+    }
+    results.push({ rule, evaluable: true, events_examined: events.length, violations });
+  }
+  return { events: events.length, results, ok: results.every((r) => r.evaluable && r.violations.length === 0), not_evaluable: results.filter((r) => !r.evaluable).map((r) => r.rule.id) };
+}
+var dwString = (s) => JSON.stringify(s);
+var filterFields = (f) => {
+  const parts = [];
+  if (f.command_like !== void 0) {
+    const list = Array.isArray(f.command_like) ? f.command_like : [f.command_like];
+    parts.push(list.length === 1 ? `input.command like ${dwString(list[0])}` : `(${list.map((p) => `input.command like ${dwString(p)}`).join(" || ")})`);
+  }
+  return parts.join(" && ");
+};
+var actionRef = (f) => `Legate::Action::${dwString(f.tool ?? "Bash")}::request`;
+function toDogwood(policy) {
+  const lines = ["// Generated from a Legate temporal policy (legate-temporal.v1). Each forbid fires at the event that breaks the rule."];
+  for (const r of policy.rules) {
+    const scopeCond = r.scope === "attempt" ? "input.task: context.input.task" : "";
+    const withScope = (fields) => [scopeCond, fields].filter(Boolean).join(", ");
+    if (r.kind === "count_within") {
+      const cond = filterFields(r.filter);
+      lines.push(`@id(${dwString(r.id)})`, `forbid (principal, action == ${actionRef(r.filter).replace(/::request$/, "")}, resource)`, `when temporal {`, `    exists (n: Long). ((count_within(${r.window_seconds}s, ${actionRef(r.filter)}{ ${withScope(cond ? `input.command: _` : "")} }${cond ? ` && ${cond.replace(/input\./g, "context.input.")}` : ""})) == n && n >= ${r.max})`, `};`);
+    } else if (r.kind === "forbid_after") {
+      lines.push(`@id(${dwString(r.id)})`, `forbid (principal, action == ${actionRef(r.forbid).replace(/::request$/, "")}, resource)`, `when ${filterFields(r.forbid).replace(/input\./g, "context.input.") || "true"}`, `when temporal {`, `    once ${actionRef(r.trigger)}{ ${withScope("input.command: _")} }${filterFields(r.trigger) ? ` && ${filterFields(r.trigger)}` : ""}`, `};`);
+    } else {
+      lines.push(`@id(${dwString(r.id)})`, `forbid (principal, action == ${actionRef(r.before).replace(/::request$/, "")}, resource)`, `when ${filterFields(r.before).replace(/input\./g, "context.input.") || "true"}`, `unless temporal {`, `    formerly within ${r.window_seconds}s ${actionRef(r.require)}{ ${withScope("input.command: _")} }${filterFields(r.require) ? ` && ${filterFields(r.require)}` : ""}`, `};`);
+    }
+  }
+  const tools = [...new Set(policy.rules.flatMap((r) => (r.kind === "count_within" ? [r.filter] : r.kind === "forbid_after" ? [r.trigger, r.forbid] : [r.before, r.require]).map((f) => f.tool ?? "Bash")))];
+  const schema = ["namespace Legate {", "  type CallInput = { command: String, task: String };", "  type CallOutput = { decision: String };", "  entity Agent;", "  entity Gate;", ...tools.map((t) => `  action ${dwString(t)} appliesTo { principal: [Agent], resource: [Gate], context: { input: CallInput } };`), "}"].join("\n");
+  return { policy: lines.join("\n"), schema };
+}
+function toDogwoodTrace(events) {
+  if (!events.length) return "";
+  const t0 = events[0].at;
+  return events.map((e) => {
+    const input = `{ command: ${dwString(e.command ?? "")}, task: ${dwString(e.task_id ? `${e.task_id}#${e.attempt}` : "run")} }`;
+    return `@${Math.max(0, Math.round((e.at - t0) / 1e3))} scope(principal: Legate::Agent::"agent", resource: Legate::Gate::"gate") request_context(input: ${input}) Legate::Action::${dwString(e.tool)}::request(input: ${input}, callerPrincipal: Legate::Agent::"agent", callerResource: Legate::Gate::"gate")`;
+  }).join("\n") + "\n";
+}
+
 // src/standard-compiler.ts
 var METHOD_LABELS = {
   gate_policy: "Enforced by the gateway before the call runs",
@@ -3214,7 +3308,7 @@ function compileStandard(draft, options = {}) {
   const gate_enforced = clauses.filter((c) => c.method === "gate_policy").map((c) => c.id);
   const not_gate_enforced = clauses.filter((c) => c.method !== "gate_policy").map((c) => c.id);
   const blockers = clauses.filter((c) => c.method === "unsupported" && c.blocking).map((c) => c.requirement);
-  return { compiler: "legate-standard-compiler.v1", tool, action_model: model, clauses, cedar, counterexamples, gate_enforced, not_gate_enforced, blockers, adoptable: blockers.length === 0 };
+  return { compiler: "legate-standard-compiler.v1", tool, action_model: model, clauses, cedar, counterexamples, gate_enforced, not_gate_enforced, blockers, adoptable: blockers.length === 0, temporal: temporalBlock(draft.requirements.run?.temporal ?? null) };
 }
 function runCounterexamples(tools) {
   const first = tools[0];
@@ -3242,8 +3336,14 @@ function enforcementBlock(compiled) {
     action_model: compiled.action_model,
     tool: compiled.tool,
     gate_enforced: compiled.gate_enforced,
-    not_gate_enforced: compiled.not_gate_enforced
+    not_gate_enforced: compiled.not_gate_enforced,
+    ...compiled.temporal ? { temporal: compiled.temporal } : {}
   };
+}
+function temporalBlock(rules) {
+  if (!rules || rules.length === 0) return null;
+  const policy = { format: TEMPORAL_POLICY_V1, rules };
+  return { format: TEMPORAL_POLICY_V1, rules, dogwood: toDogwood(policy), digest: `sha256:${sha256Hex(canonicalize(policy))}` };
 }
 function evaluateCompiledPolicy(compiled, call) {
   const reasons = [];
@@ -6151,6 +6251,30 @@ function verifyRunManifest(value, context = {}, now = /* @__PURE__ */ new Date()
       }
     }
   }
+  const temporal = std?.enforcement?.temporal ?? null;
+  if (temporal && chain) {
+    const recomputed = `sha256:${sha256Hex(canonicalize({ format: temporal.format, rules: temporal.rules }))}`;
+    if (recomputed !== temporal.digest) {
+      checks.push({ id: "temporal_policy", label: "History rules", ok: false, detail: "The history rules the standard carries do not hash to the digest it declares." });
+      bound = false;
+    } else {
+      const events = projectEvents(chain.receipts.map((r) => ({ tool: r.tool ?? "", decision: r.decision === "deny" ? "deny" : "allow", input_hash: r.input_hash ?? "", issued_at: r.issued_at ?? (/* @__PURE__ */ new Date(0)).toISOString(), link: r.hash })), { attempts: m.attempts, calls: context.calls ?? null });
+      const ev = evaluateTemporal(events, { format: temporal.format, rules: temporal.rules });
+      for (const r of ev.results) {
+        const id = `temporal_${r.rule.id}`;
+        if (!r.evaluable) {
+          checks.push({ id, label: `History rule: ${r.rule.id}`, ok: true, informational: true, detail: `Not evaluable here: ${r.reason}.` });
+          continue;
+        }
+        const ok = r.violations.length === 0;
+        checks.push({ id, label: `History rule: ${r.rule.id}`, ok, detail: ok ? `Held at every one of ${r.events_examined} receipts${r.rule.note ? ` (${r.rule.note})` : ""}.` : `Broken at receipt ${r.violations[0].event_index}: ${r.violations[0].detail} History head at that decision: ${r.violations[0].link.slice(0, 19)}\u2026${r.violations.length > 1 ? ` (${r.violations.length} violations in all)` : ""}` });
+        bound &&= ok;
+      }
+      const held = ev.results.filter((r) => r.evaluable && r.violations.length === 0).map((r) => r.rule.id);
+      if (held.length) establishes.push(`The history rules the standard declares (${held.join(", ")}) held at every receipt, replayed here from the chain; the same rules are written in Dogwood's syntax beside the standard for the reference interpreter.`);
+      if (ev.not_evaluable.length) not_established.push(`Whether the history rules that read each command held (${ev.not_evaluable.join(", ")}): supply calls.jsonl.`);
+    }
+  } else if (temporal && !chain) checks.push({ id: "temporal_policy", label: "History rules", ok: true, informational: true, detail: "The standard declares history rules; supply the receipts to replay them." });
   const rawReceipts = context.bytes?.receipts ?? context.provenance?.bytes?.receipts;
   if (receipts && rawReceipts !== void 0) {
     const digest = `sha256:${subjectDigest(rawReceipts)}`;
@@ -6580,6 +6704,7 @@ export {
   RUN_MANIFEST_V1,
   RUN_REGRADE_V1,
   SIGSTORE_PUBLIC_GOOD,
+  TEMPORAL_POLICY_V1,
   attestationEntries,
   attestationReportDigest,
   baseProofRequestDraft,
@@ -6594,6 +6719,7 @@ export {
   enforcementBlock,
   evaluateCompiledPolicy,
   evaluateGatewayReceipts,
+  evaluateTemporal,
   fileDigest,
   gatewayKeyFromPrivate,
   generateRecipientKey,
@@ -6610,6 +6736,7 @@ export {
   parseTdxQuote,
   personalSignDigest,
   policyDigest,
+  projectEvents,
   proofRequestDraftErrors,
   proofRequestReadback,
   receiptHash,
@@ -6628,6 +6755,9 @@ export {
   signedText,
   subjectDigest,
   taskSetDigest,
+  temporalBlock,
+  toDogwood,
+  toDogwoodTrace,
   trustProvenance,
   verifyActaChain,
   verifyAttestedCalls,
