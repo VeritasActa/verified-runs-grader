@@ -75,14 +75,11 @@ for (const attempt of manifest.attempts) {
       const target = join(ws, 'app', f.path); mkdirSync(dirname(target), { recursive: true }); writeFileSync(target, buf);
     }
     mkdirSync(join(ws, 'app'), { recursive: true });
-    const testsDir = join(ws, '.legate-tests'); mkdirSync(testsDir);
-    for (const [p, content] of Object.entries(testFiles[attempt.task_id])) { const target = join(testsDir, p.slice('tests/'.length)); mkdirSync(dirname(target), { recursive: true }); writeFileSync(target, content.toString('utf8').replaceAll('/app', join(ws, 'app'))); }
-    const py = spawnSync('python3', ['-m', 'pytest', '-q', '-p', 'no:cacheprovider', '-rA', testsDir], { cwd: ws, encoding: 'utf8', timeout: 180_000 });
-    const output = `${py.stdout ?? ''}${py.stderr ?? ''}`;
-    const passed = Number(output.match(/(\d+) passed/)?.[1] ?? 0); const failed = Number(output.match(/(\d+) failed/)?.[1] ?? 0) + Number(output.match(/(\d+) error/)?.[1] ?? 0);
-    const verdict = py.status === 0 && passed > 0 && failed === 0 ? 'pass' : py.status === null ? 'error' : 'fail';
-    const runner = `pytest ${(spawnSync('python3', ['-m', 'pytest', '--version'], { encoding: 'utf8' }).stdout.match(/[\d.]+/) ?? ['?'])[0]}, regrade`;
-    results.push({ task_id: attempt.task_id, attempt: attempt.attempt, verdict, tests: { runner, passed, failed, output_digest: m.fileDigest(output) }, workspace_digest: attempt.workspace.digest });
+    const rebasedTests = Object.fromEntries(Object.entries(testFiles[attempt.task_id]).map(([p, content]) => [p, /\.(py|sh|txt|json|yaml|yml|csv|md)$/.test(p) ? content.toString('utf8').replaceAll('/app', join(ws, 'app')) : content]));
+    const graded = m.gradeWorkspace({ workspace: ws, tests: rebasedTests, timeoutMs: 180_000 });
+    const { output, passed, failed, verdict } = graded; const runner = `${graded.runner}, regrade`;
+    const gradingRecord = { profile: graded.grading.profile, hygiene: graded.grading.hygiene, cross_check: { consistent: graded.grading.cross_check.consistent, exit_code: graded.grading.cross_check.exit_code }, sandbox: graded.grading.sandbox, runner: graded.grading.runner };
+    results.push({ task_id: attempt.task_id, attempt: attempt.attempt, verdict, tests: { runner, passed, failed, output_digest: m.fileDigest(output) }, workspace_digest: attempt.workspace.digest, grading: gradingRecord });
     console.log(`  ${attempt.task_id}: manifest ${attempt.verdict}, regrade ${verdict}${verdict === attempt.verdict ? '' : '  <-- DISAGREES'}`);
   } finally { rmSync(ws, { recursive: true, force: true }); }
 }
@@ -95,7 +92,14 @@ if (sign) {
   const graderName = process.env.LEGATE_GRADER_NAME || (process.env.LEGATE_GRADER_SEED ? 'ScopeBlind verified-runs grader' : keysMode === 'ephemeral' ? 'Grader (ephemeral, held by the workflow run)' : 'Legate regrader (demo)');
   const grader = process.env.LEGATE_GRADER_SEED ? m.runSignerFromPrivate(Buffer.from(process.env.LEGATE_GRADER_SEED.trim(), 'hex'), graderName) : keysMode === 'ephemeral' ? m.runSignerFromPrivate(randomBytes(32), graderName) : m.runSignerFromSeed('legate-regrader', graderName);
   const ci = process.env.GITHUB_ACTIONS && process.env.GITHUB_RUN_ID ? `${process.env.GITHUB_SERVER_URL ?? 'https://github.com'}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}` : null;
-  const regrade = m.createRunRegrade({ manifest, results, environment: { sandbox: ci ? `GitHub Actions runner (${process.platform}), separate job` : `developer machine (${process.platform})`, note: ci ? `Second grading in ${ci}; the tests were obtained ${sealedPath ? 'from the sealed archive' : 'from the benchmark repository at the pinned commit'} and checked against the pin.` : `Second grading on a developer machine; the tests were obtained ${sealedPath ? 'from the sealed archive' : 'from the benchmark repository at the pinned commit'} and checked against the pin.` } }, grader, new Date());
+  // The four independences, stated as facts about this grading, not as a claim that it is independent: who administers it, what runs the tests, where the tests came from, and what the judgment is.
+  const independence = {
+    administered_by: process.env.LEGATE_GRADER_ORG || (process.env.GITHUB_REPOSITORY ? process.env.GITHUB_REPOSITORY.split('/')[0] : 'the operator of this machine'),
+    implementation: `${results[0]?.grading?.runner ?? 'pytest'} via regrade.mjs (the same runner as the harness)`,
+    test_source: sealedPath ? 'the sealed archive the standard pins, opened with the maintainer key' : `the benchmark repository at the pinned revision ${taskSet.revision}`,
+    judgment: 'automated: the pinned tests\' verdicts, no human review',
+  };
+  const regrade = m.createRunRegrade({ manifest, results, environment: { independence, sandbox: ci ? `GitHub Actions runner (${process.platform}), separate job` : `developer machine (${process.platform})`, note: ci ? `Second grading in ${ci}; the tests were obtained ${sealedPath ? 'from the sealed archive' : 'from the benchmark repository at the pinned commit'} and checked against the pin.` : `Second grading on a developer machine; the tests were obtained ${sealedPath ? 'from the sealed archive' : 'from the benchmark repository at the pinned commit'} and checked against the pin.` } }, grader, new Date());
   writeFileSync(outPath, `${JSON.stringify(regrade, null, 2)}\n`);
   console.log(`signed regrade written to ${outPath} (grader ${grader.key_id})`);
 }

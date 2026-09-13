@@ -6267,8 +6267,10 @@ function verifyRunManifest(value, context = {}, now = /* @__PURE__ */ new Date()
     });
     const ok = sameRun && graderAccepted && distinct && agrees;
     const id = i === 0 ? "regrade" : `regrade_${i + 1}`;
-    checks.push({ id, label: i === 0 ? "Second grading" : `Grading ${i + 2}`, ok, detail: !rv.valid ? rv.detail : !sameRun ? "The regrade is for a different manifest." : !std ? "Supply the standard to check the grader." : !graderAccepted ? "The grader key is not one the standard accepts, and the regrade carries no verified provenance from a repository the standard accepts." : !distinct ? "The regrade was signed by the same key as the manifest; that is not a second party." : !agrees ? "This grading disagrees with the manifest on at least one verdict or workspace." : `A grading under key ${rg.grader.key_id}${graderByKey ? "" : " (accepted by its provenance identity)"}${madeBy}, from the archived workspaces with the pinned tests, agrees with every verdict.` });
-    bound &&= ok;
+    const unnamed = Boolean(std) && rv.valid && sameRun && !graderAccepted;
+    const profileNote = rg.results?.some((r) => r.grading?.profile === "in_process") ? " Profile: the tests import the submission, so its code ran inside the scoring interpreter (declared as the weaker profile)." : rg.results?.every((r) => r.grading?.profile === "black_box") && rg.results?.length ? " Profile: black box, the tests never import the submission." : "";
+    checks.push({ id, label: i === 0 ? "Second grading" : `Grading ${i + 2}`, ok: unnamed ? agrees : ok, ...unnamed ? { informational: true } : {}, detail: !rv.valid ? rv.detail : !sameRun ? "The regrade is for a different manifest." : !std ? "Supply the standard to check the grader." : unnamed ? `A grading by ${rg.grader.name} (${rg.grader.key_id}), which the standard does not name as a grader: it ${agrees ? "agrees with every verdict" : "DISAGREES with the manifest on at least one verdict or workspace"}, and it does not bind either way. The standard names who may reconcile its verdicts.${profileNote}` : !distinct ? "The regrade was signed by the same key as the manifest; that is not a second party." : !agrees ? "This grading disagrees with the manifest on at least one verdict or workspace." : `A grading under key ${rg.grader.key_id}${graderByKey ? "" : " (accepted by its provenance identity)"}${madeBy}, from the archived workspaces with the pinned tests, agrees with every verdict.${profileNote}` });
+    if (!unnamed) bound &&= ok;
     if (ok) {
       reconciled = true;
       const repoShort = (regradeIdentity?.repository ?? "").replace(/^https:\/\/github\.com\//, "");
@@ -6461,6 +6463,113 @@ function evaluateGatewayReceipts(input) {
     does_not_establish
   };
 }
+
+// src/grade-tests.ts
+import { spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join, relative } from "node:path";
+var HYGIENE = ["conftest.py", "pytest.ini", "tox.ini", "setup.cfg", "pyproject.toml", "sitecustomize.py", "usercustomize.py", ".pth"];
+function hasBwrap() {
+  return process.platform === "linux" && spawnSync("bwrap", ["--version"], { encoding: "utf8" }).status === 0;
+}
+function hasSeatbelt() {
+  return process.platform === "darwin" && spawnSync("sandbox-exec", ["-p", "(version 1)(allow default)", "true"], { encoding: "utf8" }).status === 0;
+}
+var seatbeltProfile = (writable) => `(version 1)(allow default)(deny network*)(deny file-write*)${writable.map((p) => `(allow file-write* (subpath "${p}"))`).join("")}(allow file-write* (subpath "/private/tmp"))(allow file-write* (subpath "/private/var/folders"))(allow file-write* (subpath "/dev"))`;
+function walk(dir, depth, out) {
+  if (depth < 0 || !existsSync(dir)) return;
+  for (const name of readdirSync(dir)) {
+    const p = join(dir, name);
+    let st;
+    try {
+      st = statSync(p);
+    } catch {
+      continue;
+    }
+    if (st.isDirectory()) {
+      if (name !== "__pycache__" && name !== ".git" && name !== "node_modules") walk(p, depth - 1, out);
+    } else out.push(p);
+  }
+}
+function scoringHijackArtifacts(appDir) {
+  const files = [];
+  walk(appDir, 6, files);
+  const refused = [];
+  for (const f of files) {
+    const base = f.split("/").pop() ?? "";
+    const rel = relative(appDir, f);
+    if (["conftest.py", "pytest.ini", "tox.ini", "sitecustomize.py", "usercustomize.py"].includes(base) || base.endsWith(".pth")) refused.push(rel);
+    else if (base === "setup.cfg" && /\[tool:pytest\]/.test(readFileSync(f, "utf8"))) refused.push(rel);
+    else if (base === "pyproject.toml" && /\[tool\.pytest/.test(readFileSync(f, "utf8"))) refused.push(rel);
+  }
+  return { checked: HYGIENE, refused };
+}
+function gradingProfile(appDir, tests) {
+  const modules = /* @__PURE__ */ new Set();
+  if (existsSync(appDir)) for (const name of readdirSync(appDir)) {
+    if (name.endsWith(".py")) modules.add(name.slice(0, -3));
+    else if (existsSync(join(appDir, name, "__init__.py"))) modules.add(name);
+  }
+  for (const [path, content2] of Object.entries(tests)) {
+    if (!path.endsWith(".py")) continue;
+    const text = typeof content2 === "string" ? content2 : Buffer.from(content2).toString("utf8");
+    for (const m of text.matchAll(/^\s*(?:from\s+([\w.]+)\s+import|import\s+([\w.]+))/gm)) {
+      const root = (m[1] ?? m[2] ?? "").split(".")[0];
+      if (modules.has(root)) return "in_process";
+    }
+    if (/importlib|sys\.path\.(insert|append)|__import__\(/.test(text)) return "in_process";
+  }
+  return "black_box";
+}
+function gradeWorkspace(input) {
+  const ws = input.workspace;
+  const appDir = join(ws, "app");
+  const python = input.python ?? "python3";
+  const version = (spawnSync(python, ["-m", "pytest", "--version"], { encoding: "utf8" }).stdout.match(/[\d.]+/) ?? ["?"])[0];
+  const sandbox = hasBwrap() ? "bubblewrap" : hasSeatbelt() ? "seatbelt" : "none";
+  const runner = `pytest ${version}, hardened runner (no conftest, no plugin autoload, isolated configuration, user site and cwd off the path, JUnit cross-check), ${sandbox === "none" ? "no sandbox" : sandbox} sandbox`;
+  const hygiene = scoringHijackArtifacts(appDir);
+  const profile = gradingProfile(appDir, input.tests);
+  const base = (verdict, passed, failed, output, cross) => ({ verdict, passed, failed, output, runner, grading: { profile, hygiene, cross_check: cross, sandbox, runner } });
+  if (hygiene.refused.length) return base("fail", 0, 0, `grading refused before any test ran: the workspace carries scoring-hijack artifacts (${hygiene.refused.join(", ")}). A submission is graded by the task's tests, not by configuration it plants for the runner.`, { junit: null, summary: { passed: 0, failed: 0 }, exit_code: null, consistent: true });
+  const testsDir = join(ws, ".legate-tests");
+  rmSync(testsDir, { recursive: true, force: true });
+  mkdirSync(testsDir, { recursive: true });
+  for (const [p, content2] of Object.entries(input.tests)) {
+    const target = join(testsDir, p.replace(/^tests\//, ""));
+    mkdirSync(dirname(target), { recursive: true });
+    writeFileSync(target, content2);
+  }
+  const protectedDir = mkdtempSync(join(tmpdir(), "legate-grade-"));
+  try {
+    writeFileSync(join(protectedDir, "pytest.ini"), "[pytest]\naddopts = -p no:cacheprovider\n");
+    const junitPath = join(protectedDir, "result.xml");
+    const args = ["-m", "pytest", "-q", "-rA", "-p", "no:cacheprovider", "--noconftest", "-c", join(protectedDir, "pytest.ini"), "--rootdir", testsDir, `--junitxml=${junitPath}`, testsDir];
+    const env = { ...process.env, PYTHONNOUSERSITE: "1", PYTHONSAFEPATH: "1", PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1", PYTHONDONTWRITEBYTECODE: "1", PYTHONHASHSEED: "0" };
+    const argv = sandbox === "bubblewrap" ? ["bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--bind", ws, ws, "--bind", protectedDir, protectedDir, "--unshare-net", "--die-with-parent", "--chdir", ws, python, ...args] : sandbox === "seatbelt" ? ["sandbox-exec", "-p", seatbeltProfile([ws, protectedDir]), python, ...args] : [python, ...args];
+    const py = spawnSync(argv[0], argv.slice(1), { cwd: ws, encoding: "utf8", timeout: input.timeoutMs ?? 18e4, env, maxBuffer: 64 * 1024 * 1024 });
+    const output = `${py.stdout ?? ""}${py.stderr ?? ""}`;
+    const passed = Number(output.match(/(\d+) passed/)?.[1] ?? 0);
+    const failed = Number(output.match(/(\d+) failed/)?.[1] ?? 0) + Number(output.match(/(\d+) error/)?.[1] ?? 0);
+    let junit = null;
+    if (existsSync(junitPath)) {
+      const xml = readFileSync(junitPath, "utf8");
+      const num = (name) => [...xml.matchAll(new RegExp(`<testsuite [^>]*\\b${name}="(\\d+)"`, "g"))].reduce((n, m) => n + Number(m[1]), 0);
+      junit = { tests: num("tests"), failures: num("failures"), errors: num("errors"), skipped: num("skipped") };
+    }
+    const exit_code = py.status;
+    const consistent = junit !== null && junit.tests - junit.failures - junit.errors - junit.skipped === passed && junit.failures + junit.errors === failed && (exit_code === 0 ? failed === 0 && passed > 0 : exit_code === 5 ? passed === 0 && failed === 0 : exit_code === 1 ? failed > 0 : false);
+    const cross = { junit, summary: { passed, failed }, exit_code, consistent };
+    if (py.status === null) return base("error", passed, failed, `${output}
+[grader] the tests did not finish within ${(input.timeoutMs ?? 18e4) / 1e3} s`, cross);
+    if (!consistent) return base("error", passed, failed, `${output}
+[grader] cross-check failed: summary (${passed} passed, ${failed} failed), JUnit (${junit ? `${junit.tests} tests, ${junit.failures} failures, ${junit.errors} errors, ${junit.skipped} skipped` : "missing"}), exit ${exit_code} do not agree; the result is not trusted`, cross);
+    return base(exit_code === 0 && passed > 0 && failed === 0 ? "pass" : "fail", passed, failed, output, cross);
+  } finally {
+    rmSync(protectedDir, { recursive: true, force: true });
+  }
+}
 export {
   GATEWAY_DEMO_KID,
   GATEWAY_DEMO_LABEL,
@@ -6488,6 +6597,8 @@ export {
   fileDigest,
   gatewayKeyFromPrivate,
   generateRecipientKey,
+  gradeWorkspace,
+  gradingProfile,
   isDemoGatewayKey,
   isDemoRecipientKey,
   isDemoRunSignerKey,
@@ -6511,6 +6622,7 @@ export {
   runSignerFromPrivate,
   runSignerFromSeed,
   sbIssuerKid,
+  scoringHijackArtifacts,
   setDeterministicEntropy,
   sha256Hex,
   signedText,
