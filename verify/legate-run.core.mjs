@@ -2824,10 +2824,10 @@ function verifyActaChain(receipts, options = {}) {
 // src/temporal.ts
 var TEMPORAL_POLICY_V1 = "legate-temporal.v1";
 var globToRegExp = (glob) => new RegExp(`^${glob.split("*").map((s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join(".*")}$`, "s");
-var likes = (pattern, value) => {
-  if (pattern === void 0) return true;
+var likes = (pattern2, value) => {
+  if (pattern2 === void 0) return true;
   if (value === null) return null;
-  const list = Array.isArray(pattern) ? pattern : [pattern];
+  const list = Array.isArray(pattern2) ? pattern2 : [pattern2];
   return list.some((p) => globToRegExp(p).test(value));
 };
 function matches(filter, e) {
@@ -2879,38 +2879,54 @@ function evaluateTemporal(events, policy) {
   return { events: events.length, results, ok: results.every((r) => r.evaluable && r.violations.length === 0), not_evaluable: results.filter((r) => !r.evaluable).map((r) => r.rule.id) };
 }
 var dwString = (s) => JSON.stringify(s);
-var filterFields = (f) => {
-  const parts = [];
-  if (f.command_like !== void 0) {
-    const list = Array.isArray(f.command_like) ? f.command_like : [f.command_like];
-    parts.push(list.length === 1 ? `input.command like ${dwString(list[0])}` : `(${list.map((p) => `input.command like ${dwString(p)}`).join(" || ")})`);
-  }
-  return parts.join(" && ");
-};
-var actionRef = (f) => `Legate::Action::${dwString(f.tool ?? "Bash")}::request`;
-function toDogwood(policy) {
-  const lines = ["// Generated from a Legate temporal policy (legate-temporal.v1). Each forbid fires at the event that breaks the rule."];
+var actionOf = (f) => `Legate::Action::${dwString(f.tool ?? "Bash")}`;
+var derivedName = (ruleId, role) => `p_${ruleId.replace(/[^A-Za-z0-9_]/g, "_")}_${role}`;
+function derivedOf(policy) {
+  const out = [];
   for (const r of policy.rules) {
-    const scopeCond = r.scope === "attempt" ? "input.task: context.input.task" : "";
-    const withScope = (fields) => [scopeCond, fields].filter(Boolean).join(", ");
+    const parts = r.kind === "count_within" ? [["match", r.filter]] : r.kind === "forbid_after" ? [["trigger", r.trigger], ["forbid", r.forbid]] : [["before", r.before], ["require", r.require]];
+    for (const [role, f] of parts) if (f.command_like !== void 0) out.push({ name: derivedName(r.id, role), patterns: Array.isArray(f.command_like) ? f.command_like : [f.command_like], rule: r.id, role, filter: f });
+  }
+  return out;
+}
+var pattern = (f, scope, derived) => {
+  const fields = [scope === "attempt" ? "input.task: context.input.task" : null, derived ? `input.${derived}: true` : null].filter(Boolean).join(", ");
+  return `${actionOf(f)}::request{ ${fields} }`;
+};
+function toDogwood(policy) {
+  const derived = derivedOf(policy);
+  const d = (rule, role) => derived.find((x) => x.rule === rule && x.role === role)?.name ?? null;
+  const lines = ["// Generated from a Legate temporal policy (legate-temporal.v1). A base permit, then one forbid per rule, firing at the event that breaks it."];
+  if (derived.length) {
+    lines.push("// Derived predicates carried by the trace (Dogwood compares, it does not pattern-match); each is: the command matches any of the globs.");
+    for (const x of derived) lines.push(`//   ${x.name} := command like ${x.patterns.map(dwString).join(" or ")}`);
+  }
+  lines.push('@id("legate_base_permit")', "permit (principal, action, resource);");
+  for (const r of policy.rules) {
     if (r.kind === "count_within") {
-      const cond = filterFields(r.filter);
-      lines.push(`@id(${dwString(r.id)})`, `forbid (principal, action == ${actionRef(r.filter).replace(/::request$/, "")}, resource)`, `when temporal {`, `    exists (n: Long). ((count_within(${r.window_seconds}s, ${actionRef(r.filter)}{ ${withScope(cond ? `input.command: _` : "")} }${cond ? ` && ${cond.replace(/input\./g, "context.input.")}` : ""})) == n && n >= ${r.max})`, `};`);
+      const name = d(r.id, "match");
+      lines.push(`@id(${dwString(r.id)})`, `forbid (principal, action == ${actionOf(r.filter)}, resource)`, ...name ? [`when { context.input.${name} == true }`] : [], `when temporal {`, `    exists (n: Long). ((count_within(${r.window_seconds}s, ${pattern(r.filter, r.scope, name)})) == n && n > ${r.max})`, `};`);
     } else if (r.kind === "forbid_after") {
-      lines.push(`@id(${dwString(r.id)})`, `forbid (principal, action == ${actionRef(r.forbid).replace(/::request$/, "")}, resource)`, `when ${filterFields(r.forbid).replace(/input\./g, "context.input.") || "true"}`, `when temporal {`, `    once ${actionRef(r.trigger)}{ ${withScope("input.command: _")} }${filterFields(r.trigger) ? ` && ${filterFields(r.trigger)}` : ""}`, `};`);
+      const trig = d(r.id, "trigger");
+      const forb = d(r.id, "forbid");
+      lines.push(`@id(${dwString(r.id)})`, `forbid (principal, action == ${actionOf(r.forbid)}, resource)`, ...forb ? [`when { context.input.${forb} == true }`] : [], `when temporal {`, `    formerly within 86400s ${pattern(r.trigger, r.scope, trig)}`, `};`);
     } else {
-      lines.push(`@id(${dwString(r.id)})`, `forbid (principal, action == ${actionRef(r.before).replace(/::request$/, "")}, resource)`, `when ${filterFields(r.before).replace(/input\./g, "context.input.") || "true"}`, `unless temporal {`, `    formerly within ${r.window_seconds}s ${actionRef(r.require)}{ ${withScope("input.command: _")} }${filterFields(r.require) ? ` && ${filterFields(r.require)}` : ""}`, `};`);
+      const bef = d(r.id, "before");
+      const req = d(r.id, "require");
+      lines.push(`@id(${dwString(r.id)})`, `forbid (principal, action == ${actionOf(r.before)}, resource)`, ...bef ? [`when { context.input.${bef} == true }`] : [], `unless temporal {`, `    formerly within ${r.window_seconds}s ${pattern(r.require, r.scope, req)}`, `};`);
     }
   }
   const tools = [...new Set(policy.rules.flatMap((r) => (r.kind === "count_within" ? [r.filter] : r.kind === "forbid_after" ? [r.trigger, r.forbid] : [r.before, r.require]).map((f) => f.tool ?? "Bash")))];
-  const schema = ["namespace Legate {", "  type CallInput = { command: String, task: String };", "  type CallOutput = { decision: String };", "  entity Agent;", "  entity Gate;", ...tools.map((t) => `  action ${dwString(t)} appliesTo { principal: [Agent], resource: [Gate], context: { input: CallInput } };`), "}"].join("\n");
+  const schema = ["namespace Legate {", `  type CallInput = { command: String, task: String${derived.map((x) => `, ${x.name}: Bool`).join("")} };`, "  type SystemContext = { now: datetime };", "  entity Agent;", "  entity Gate;", ...tools.map((t) => `  action ${dwString(t)} appliesTo { principal: [Agent], resource: [Gate], context: { input: CallInput, system: SystemContext } };`), "}"].join("\n");
   return { policy: lines.join("\n"), schema };
 }
-function toDogwoodTrace(events) {
+function toDogwoodTrace(events, policy) {
   if (!events.length) return "";
   const t0 = events[0].at;
+  const derived = policy ? derivedOf(policy) : [];
   return events.map((e) => {
-    const input = `{ command: ${dwString(e.command ?? "")}, task: ${dwString(e.task_id ? `${e.task_id}#${e.attempt}` : "run")} }`;
+    const flags = derived.map((x) => `, ${x.name}: ${matches(x.filter, e) === true ? "true" : "false"}`).join("");
+    const input = `{ command: ${dwString(e.command ?? "")}, task: ${dwString(e.task_id ? `${e.task_id}#${e.attempt}` : "run")}${flags} }`;
     return `@${Math.max(0, Math.round((e.at - t0) / 1e3))} scope(principal: Legate::Agent::"agent", resource: Legate::Gate::"gate") request_context(input: ${input}) Legate::Action::${dwString(e.tool)}::request(input: ${input}, callerPrincipal: Legate::Agent::"agent", callerResource: Legate::Gate::"gate")`;
   }).join("\n") + "\n";
 }
