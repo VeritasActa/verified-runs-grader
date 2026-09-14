@@ -36,7 +36,13 @@ Three steps, no keys to manage:
 
 1. Fork this repository under your own organization. The workflow, the grading script, and the vendored verifier come with it; the key is generated inside each run.
 2. Run `regrade.yml` on any run in the runs repository (`-f run=runs/<name>`). The grading and its provenance bundle are the run's artifact; `gh attestation verify regrade.json --owner <your org>` checks the bundle independently.
-3. Ask the runs repository's maintainer to name your fork under `trust.accepted_grader_provenance` (the workflow flag `--accept-grader-repo https://github.com/<you>/<fork>`). From then on your gradings reconcile runs; until then they stand as a third word the standard did not choose, and a reader weighs them as such.
+
+   A fresh fork registers no workflows until its first push, so `gh workflow run` can answer `HTTP 404: workflow regrade.yml not found on the default branch` while the file is sitting there, and `gh workflow enable` cannot help because nothing is registered yet. The message means "present but not yet registered", not "missing". One empty commit registers it:
+
+   ```
+   gh repo clone <you>/verified-runs-grader && cd verified-runs-grader && git commit --allow-empty -m "register workflows" && git push
+   ```
+3. Open an issue on the runs repository naming your fork; the maintainer names it under `trust.accepted_grader_provenance` (the workflow flag `--accept-grader-repo https://github.com/<you>/<fork>`). From then on your gradings reconcile runs; until then they stand as a third word the standard did not choose, and a reader weighs them as such.
 
 ## Contents
 
